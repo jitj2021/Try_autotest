@@ -1163,6 +1163,98 @@ class UnifiedDesktopController:
             logger.error(f"❌ UIA 控件实例化异常: {e}")
             raise
 
+    @staticmethod
+    def _is_table_provider(ctrl):
+        """判断控件是否是真正的表格 provider（支持 Grid/Table Pattern）。
+        uiautomation 的 ControlTypeName 属性只是按 UIA ControlType 属性查表得到的
+        "字符串标签"，并不保证该对象实现了 GridPattern——例如 WinForms DataGridView
+        的外层滚动面板 Pane 也可能被标成 'Table'，但 GetGridPattern() 返回 None，
+        拿它去遍历子树自然提取不到任何表格内容。"""
+        for get_pattern in ('GetGridPattern', 'GetTablePattern'):
+            try:
+                if getattr(ctrl, get_pattern, lambda: None)() is not None:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _find_table_control(self, root=None, max_depth=15, timeout=5):
+        """在窗口子树中查找真正的表格控件（带 Grid/Table Pattern 的 Table/DataGrid/List）。
+        【修复说明】旧实现只取第一个 TableControl(searchDepth=15)，命中的往往是
+        没有 GridPattern 的伪表格容器（如 DataGridView 外层 Pane），导致后续
+        行列提取全部落空——即"提取不到表格里内容"的直接原因。
+        :return: 表格控件对象；找不到返回 None
+        """
+        if not UIAUTOMATION_AVAILABLE:
+            return None
+        root = root or self.auto_window
+        if root is None:
+            return None
+
+        TABLE_TYPES = ('Table', 'DataGrid', 'List')
+
+        def _pick_first_valid(controls):
+            valid = [c for c in controls if c is not None and self._is_table_provider(c)]
+            if not valid:
+                return None
+            # 多个候选时取面积最大者，避免命中隐藏/零尺寸或极小的装饰性表格
+            def _area(c):
+                r = self._rect_of(c)
+                return (r[2] - r[0]) * (r[3] - r[1]) if r else 0
+            return max(valid, key=_area)
+
+        # 方式1：按类型逐个查找（searchDepth 默认从根浅层开始）
+        for type_name in ('Table', 'DataGrid', 'List'):
+            found = []
+            idx = 1
+            while idx <= 5:  # 最多探测前 5 个同名控件
+                try:
+                    ctrl_class = {'Table': auto.TableControl,
+                                  'DataGrid': auto.DataGridControl,
+                                  'List': auto.ListControl}[type_name]
+                    ctrl = ctrl_class(searchFromControl=root, searchDepth=max_depth, foundIndex=idx)
+                    if not ctrl.Exists(timeout if idx == 1 else 0.5, 0.3):
+                        break
+                except Exception:
+                    break
+                found.append(ctrl)
+                if len(found) == 1 and self._is_table_provider(ctrl):
+                    return ctrl  # 第一个就有效，直接返回
+                idx += 1
+            picked = _pick_first_valid(found)
+            if picked is not None:
+                logger.info(f"✅ 定位到有效表格控件(type={type_name}): '{getattr(picked, 'Name', '')}'")
+                return picked
+
+        # 方式2：暴力遍历子树，找任意实现了 Grid/Table Pattern 的控件
+        try:
+            candidates = []
+
+            def _walk(ctrl, depth=0):
+                if depth > max_depth or len(candidates) >= 10:
+                    return
+                try:
+                    children = ctrl.GetChildren() or []
+                except Exception:
+                    children = []
+                for ch in children:
+                    try:
+                        if self._is_table_provider(ch):
+                            candidates.append(ch)
+                    except Exception:
+                        pass
+                    _walk(ch, depth + 1)
+
+            _walk(root)
+            picked = _pick_first_valid(candidates)
+            if picked is not None:
+                logger.info("✅ 兜底遍历定位到带 Grid/Table Pattern 的表格控件")
+                return picked
+        except Exception as e:
+            logger.debug(f"表格暴力遍历异常: {e}")
+
+        return None
+
     def _get_uia_table_structure(self, table_control=None, timeout=5):
         """
         【增强版-兼容WinForms】自动识别 DataGridView 的结构：获取所有列名。
@@ -1173,14 +1265,16 @@ class UnifiedDesktopController:
 
         # 1. 获取表格控件
         if table_control is None:
-            try:
-                table_control = self.auto_window.TableControl(searchDepth=15)
-                if not table_control.Exists(timeout, 0.5):
-                    logger.warning("⚠️ 未在当前窗口找到 Table 控件")
-                    return None, []
-            except Exception as e:
-                logger.error(f"❌ 查找 Table 控件异常: {e}")
+            table_control = self._find_table_control(timeout=timeout)
+            if table_control is None:
+                logger.warning("⚠️ 未在当前窗口找到有效 Table 控件（含 Grid/Table Pattern 兜底查找）")
                 return None, []
+        elif not self._is_table_provider(table_control):
+            # 调用方传入的控件可能是无 GridPattern 的伪表格容器，尝试重新定位真表格
+            better = self._find_table_control(timeout=min(timeout, 2))
+            if better is not None:
+                logger.info("🔄 传入的表格控件不支持 Grid/Table Pattern，已改用自动定位到的有效表格")
+                table_control = better
 
         column_names = []
         
@@ -1301,6 +1395,118 @@ class UnifiedDesktopController:
         return table_control, unique_cols
     
 
+    def _ocr_extract_table_cells(self, table_control, column_names):
+        """【兜底】UIA 完全拿不到行控件时，对整个表格区域截图 OCR，
+        按文本块坐标聚类成行、按列名 x 中心对齐成列。
+        :return: [(row_text, [cell_text, ...]), ...]；失败返回 None
+        """
+        try:
+            import cv2
+            rect = self._rect_of(table_control)
+            if not rect:
+                return None
+            left, top, right, bottom = rect
+            left = max(0, int(left)); top = max(0, int(top))
+            right = min(self.screen_width, int(right))
+            bottom = min(self.screen_height, int(bottom))
+            if right - left < 50 or bottom - top < 30:
+                return None
+
+            with mss.mss() as sct:
+                monitor = {"top": top, "left": left, "width": right - left, "height": bottom - top}
+                img_bgra = np.array(sct.grab(monitor))
+                img_bgr = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
+                temp_path = os.path.join(self.report.img_dir, f"temp_table_{int(time.time()*1000)}.jpg")
+                cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tofile(temp_path)
+
+            ocr_res = self.ocr.ocr_with_image(temp_path)
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+            if not ocr_res or ocr_res.get('code') != 100:
+                return None
+
+            blocks = []
+            for item in ocr_res.get('data', []):
+                txt = (item.get('text') or '').strip()
+                box = item.get('box') or []
+                if not txt or len(box) < 4:
+                    continue
+                xs = [p[0] for p in box]; ys = [p[1] for p in box]
+                cx = (min(xs) + max(xs)) / 2.0
+                cy = (min(ys) + max(ys)) / 2.0
+                h = max(ys) - min(ys)
+                blocks.append({'t': txt, 'cx': cx, 'cy': cy, 'h': h})
+            if not blocks:
+                return None
+
+            # 1) 去掉与表头文字相同的块（只匹配最顶部一小条区域内的，避免误删数据）
+            header_set = {re.sub(r'\s+', '', str(c)) for c in (column_names or [])}
+            body_min_cy = None
+            if header_set and column_names:
+                # 用第一列名的 y 作为表头基准：与其垂直距离很近且文本等于某列名的块视为表头
+                hdr_ys = [b['cy'] for b in blocks if re.sub(r'\s+', '', b['t']) in header_set]
+                if hdr_ys:
+                    hdr_band = min(hdr_ys)
+                    body_min_cy = hdr_band
+                    blocks = [b for b in blocks
+                              if not (re.sub(r'\s+', '', b['t']) in header_set and abs(b['cy'] - hdr_band) < 20)]
+            if not blocks:
+                return None
+
+            # 2) 按 cy 聚类成行
+            blocks.sort(key=lambda b: b['cy'])
+            med_h = sorted(b['h'] for b in blocks)[len(blocks) // 2] or 15
+            row_tol = max(8, med_h * 0.7)
+            rows = []
+            for b in blocks:
+                if rows and abs(b['cy'] - rows[-1]['cy_ref']) <= row_tol:
+                    r = rows[-1]
+                    r['items'].append(b)
+                    n = len(r['items'])
+                    r['cy_ref'] = r['cy_ref'] + (b['cy'] - r['cy_ref']) / n
+                else:
+                    rows.append({'cy_ref': b['cy'], 'items': [b]})
+
+            # 3) 确定列边界：把所有数据块 cx 排序后按间隙聚类成列
+            cxs = sorted(b['cx'] for r in rows for b in r['items'])
+            clusters = []
+            gap_tol = (right - left) / max(4, (len(column_names) or 5) * 2)
+            for x in cxs:
+                if clusters and x - clusters[-1][-1] <= max(gap_tol, 25):
+                    clusters[-1].append(x)
+                else:
+                    clusters.append([x])
+            col_centers = [sum(c) / len(c) for c in clusters]
+
+            result = []
+            n_expect_cols = len(column_names) if column_names else 0
+            for r in rows:
+                items = sorted(r['items'], key=lambda b: b['cx'])
+                texts = [it['t'] for it in items]
+                joined = ' | '.join(texts)
+                if not joined.strip():
+                    continue
+                # 若聚出的列数与预期列数一致，直接按顺序输出；
+                # 不一致时按列中心就近归位，保证索引与列名对应
+                if n_expect_cols and len(texts) != n_expect_cols and col_centers:
+                    aligned = [''] * n_expect_cols
+                    for it in items:
+                        ci = min(range(len(col_centers)), key=lambda k: abs(col_centers[k] - it['cx']))
+                        if ci < n_expect_cols:
+                            aligned[ci] = (aligned[ci] + ' ' + it['t']).strip()
+                    texts = aligned
+                result.append((joined, texts))
+
+            if len(result) >= 2:
+                logger.info(f"✅ 策略F (整表OCR): 提取到 {len(result)} 行数据，示例: {result[0][1]}")
+                return result
+            return None
+        except Exception as e:
+            logger.debug(f"整表 OCR 兜底异常: {e}")
+            return None
+
     def check_table_data(self, expected_data, column_names_map=None, row_start=0, tolerance=0.01, timeout=5, table_control=None, strict_mode=True):
         """
         核对参考数据与 UI 表格的数据行。
@@ -1399,6 +1605,110 @@ class UnifiedDesktopController:
             if not is_matched:
                 extra_in_actual.append(act_key)
 
+        # 【修复】清洗 OCR 表头中混入的非列名碎片（行号、滚动条按钮符号等）。
+        # 真正的列名几乎总是包含字母/汉字等单位或语义信息，而 "2"/"3"/"▼"/"▲" 这类
+        # 纯数字或纯符号项是 OCR 把首行行号、表头排序箭头误当文本块的结果。
+        # 注意：辅助函数全部内联定义在本方法作用域内，避免依赖其他方法的局部函数
+        # （此前引用了 _find_table_and_headers 内部的 _looks_numeric 导致 NameError）。
+        try:
+            def _is_noise_header_token(s):
+                t = str(s).strip()
+                if not t:
+                    return True
+                # 纯数字判定（如 '2', '3.0', '-1,5'）
+                try:
+                    float(t.replace(',', ''))
+                    return True
+                except (TypeError, ValueError):
+                    pass
+                core = re.sub(r'[\s\W_]+', '', t, flags=re.UNICODE)
+                # 去掉所有非标点字符后为空 => 纯符号（▲▼× 等）；或只剩单个无意义字符
+                if not core or len(core) <= 1:
+                    return True
+                return False
+
+            if len(actual_col_names) >= max(2, len(expected_keys)):
+                cleaned = [c for c in actual_col_names if not _is_noise_header_token(c)]
+                # 只有清洗后仍能覆盖全部预期列时才采用，避免误删真实列名
+                if cleaned and all(normalize_col(k) in {normalize_col(c) for c in cleaned}
+                                   for k in expected_keys):
+                    removed_frags = [c for c in actual_col_names if c not in cleaned]
+                    if removed_frags:
+                        logger.info(f"🧹 已剔除表头中的非列名碎片: {removed_frags}")
+                        actual_col_names = cleaned
+        except Exception as e:
+            # 清洗逻辑属于锦上添花，任何异常都不应中断核对主流程
+            logger.warning(f"⚠️ 表头碎片清洗跳过: {e}")
+
+        # 【修复】OCR 近似重复列名去歧义：例如首列被识别成 "序亏"，
+        # 与 "序号" 都命中预期列 "序号"，导致严格模式误判列结构不一致。
+        def _col_similarity(n_act, n_exp):
+            """归一化后的列名相似度：完全相等 > 包含关系 > 字符重合度。"""
+            if not n_act or not n_exp:
+                return 0.0
+            if n_act == n_exp:
+                return 2.0
+            if n_exp in n_act or n_act in n_exp:
+                return 1.0 + min(len(n_act), len(n_exp)) / max(len(n_act), len(n_exp))
+            inter = len(set(n_act) & set(n_exp))
+            union = len(set(n_act) | set(n_exp))
+            return inter / union if union else 0.0
+
+        if matched_cols and extra_in_actual:
+            # a) 某个预期列被映射到了相似度更低的实际列 -> 换绑到更优候选
+            dropped = []
+            kept_matched = {}
+            for exp_key, act_val in matched_cols.items():
+                n_act, n_exp = normalize_col(act_val), normalize_col(exp_key)
+                best_col, best_score = act_val, _col_similarity(n_act, n_exp)
+                for c in actual_col_names:
+                    if c == act_val or c in matched_cols.values():
+                        continue
+                    s = _col_similarity(normalize_col(c), n_exp)
+                    if s > best_score:
+                        best_col, best_score = c, s
+                if best_col != act_val:
+                    dropped.append(act_val)
+                    kept_matched[exp_key] = best_col
+                else:
+                    kept_matched[exp_key] = act_val
+            if dropped:
+                logger.info(f"🧹 表头去歧义：剔除 OCR 误识别/低相似度的重复匹配列名 {dropped}")
+                matched_cols = kept_matched
+                actual_col_names = [c for c in actual_col_names if c not in dropped]
+                used = set(matched_cols.values())
+                extra_in_actual = [c for c in extra_in_actual if c not in dropped and c not in used]
+                missing_in_actual = [k for k in missing_in_actual if k not in matched_cols]
+
+            # b) 剩余“多余列”若只是某个预期列的 OCR 误识别变体（与所有预期列
+            #    的相似度都低于其最佳匹配列，且不与任何其他实际列混淆），
+            #    则判定为表头碎片并剔除；真正多出的列仍会保留并触发严格模式报错。
+            if matched_cols and extra_in_actual:
+                exp_norms_all = [normalize_col(k) for k in expected_keys]
+                used_vals = set(matched_cols.values())
+                pseudo = []
+                for cand in list(extra_in_actual):
+                    n_cand = normalize_col(cand)
+                    best_exp = max(exp_norms_all, key=lambda ne: _col_similarity(n_cand, ne))
+                    score_vs_expected = _col_similarity(n_cand, best_exp)
+                    # 与任何预期列都不相似 -> 可能是真实多余列，保留
+                    if score_vs_expected < 0.6:
+                        continue
+                    # 找到与该预期列对应的已匹配列；若匹配列与候选几乎相同（如仅括号差异），
+                    # 说明二者是同一列的两个识别结果，剔除较差的那个。
+                    pair = None
+                    # 优先比较归一化后最短的匹配列（OCR 碎片通常更长或含噪声字符）
+                    for av in sorted(used_vals, key=lambda x: len(normalize_col(x))):
+                        if _col_similarity(normalize_col(av), best_exp) >= score_vs_expected:
+                            pair = av
+                            break
+                    if pair is not None and _col_similarity(n_cand, normalize_col(pair)) >= 0.6:
+                        pseudo.append(cand)
+                if pseudo:
+                    logger.info(f"🧹 剔除疑似 OCR 误识别的表头碎片列: {pseudo}")
+                    actual_col_names = [c for c in actual_col_names if c not in pseudo]
+                    extra_in_actual = [c for c in extra_in_actual if c not in pseudo]
+
         # 报告列差异
         error_msg_parts = []
         if missing_in_actual:
@@ -1448,39 +1758,156 @@ class UnifiedDesktopController:
             except Exception:
                 return ''
 
-        try:
-            data_rows = []
-            visited = set()
-            def _find_rows(parent, depth=0):
-                if depth > 4 or len(data_rows) >= max(100, len(expected_data) + row_start + 20):
+        def _row_key(ctrl):
+            """行的唯一标识：优先 RuntimeId，退化到 BoundingRectangle。"""
+            try:
+                rid = ctrl.GetRuntimeId()
+                if rid:
+                    return tuple(rid)
+            except Exception:
+                pass
+            r = self._rect_of(ctrl)
+            return ('rect', r) if r else ('id', id(ctrl))
+
+        def _find_rows_structural():
+            """在表格子树中查找 Row/DataItem 行控件（不依赖 GridPattern）。"""
+            rows, visited = [], set()
+            max_rows = max(100, len(expected_data) * 3 + 50)
+
+            def _walk(parent, depth=0):
+                if depth > 6 or len(rows) >= max_rows:
                     return
                 for child in _children_safe(parent):
-                    try:
-                        ident = child.GetRuntimeId()
-                    except Exception:
-                        ident = id(child)
-                    if ident in visited:
+                    k = _row_key(child)
+                    if k in visited:
                         continue
-                    visited.add(ident)
+                    visited.add(k)
                     typ = _ctrl_type(child)
                     name = _ctrl_name(child)
                     if 'Header' in typ or 'Header' in name:
                         continue
-                    grandchildren = _children_safe(child)
-                    # Row 控件优先；某些 provider 将行暴露为 DataItem/Custom。
-                    if typ == 'Row' or (typ in ('DataItem', 'Custom') and grandchildren and
-                                        (any(_ctrl_type(x) in ('DataItem', 'Text', 'Custom') for x in grandchildren))):
-                        data_rows.append(child)
+                    kids = _children_safe(child)
+                    kid_types = [_ctrl_type(x) for x in kids]
+                    is_row_like = (
+                        typ == 'Row'
+                        or (typ == 'DataItem' and kids and any(t in ('Edit','Text','Custom','DataItem') for t in kid_types))
+                        or (typ == 'Custom' and len(kids) >= max(2, len(actual_col_names)))
+                    )
+                    if is_row_like:
+                        rows.append(child)
                     else:
-                        _find_rows(child, depth + 1)
-            _find_rows(actual_table)
+                        _walk(child, depth + 1)
+            _walk(actual_table)
+            return rows
 
-            # 去掉嵌套重复行：只保留最外层候选，避免同一行被重复核对。
-            if not data_rows:
-                logger.warning('⚠️ UIA 树中未发现明确 Row 控件，将尝试从表格后代读取单元格')
+        def _dedupe_rows(rows):
+            """同一矩形只保留第一个（最外层），保持 UIA 顺序。"""
+            seen, out = set(), []
+            for r in rows:
+                k = _row_key(r)
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(r)
+            return out
+
+        def _cell_value_text(ctrl):
+            """读取单元格文本：优先 GridItemPattern.Value（DataGridView 单元格的官方取值口），
+            其次 ValuePattern，最后 Name。多种 provider 只在前两者暴露数据。"""
+            best = ''
+            try:
+                gip = ctrl.GetGridItemPattern()
+            except Exception:
+                gip = None
+            if gip is not None:
+                try:
+                    best = str(gip.Value or '').strip()
+                except Exception:
+                    best = ''
+            if not best:
+                vp = self._get_value_pattern(ctrl)
+                if vp:
+                    try:
+                        best = str(vp.Value or '').strip()
+                    except Exception:
+                        pass
+            if not best:
+                best = _ctrl_name(ctrl)
+            return best
+
+        data_rows = []
+
+        # --- 策略 D（首选）：GridPattern/TablePattern 官方行列 API ---
+        # WinForms DataGridView 的行经常是虚拟化/嵌套的 Custom 容器，
+        # 直接遍历子树找不到 Row；而 provider 一定实现了 Grid Pattern，
+        # GetItem(row, col) 能可靠取到每个单元格——这是本问题的核心修复。
+        grid_cells = None  # [(row_text, [cell_ctrl,...]), ...]
+        try:
+            gp = None
+            for getter in ('GetGridPattern', 'GetTablePattern'):
+                try:
+                    gp = getattr(actual_table, getter, lambda: None)()
+                    if gp is not None:
+                        break
+                except Exception:
+                    gp = None
+            if gp is not None:
+                g_rows = int(getattr(gp, 'currentRowCount', 0) or 0)
+                g_cols = int(getattr(gp, 'currentColumnCount', 0) or 0)
+                n_exp_cols = max(len(actual_col_names), 1)
+                # 明显不合理时收敛范围，防止超大网格逐格遍历卡死
+                g_rows = min(g_rows, max(len(expected_data) + row_start + 20, 200))
+                parsed = []
+                for ri in range(g_rows):
+                    cells_c = []
+                    texts = []
+                    for ci in range(min(g_cols, 64)):
+                        try:
+                            item = gp.GetItem(ri, ci)
+                        except Exception:
+                            item = None
+                        if item is None:
+                            texts.append('')
+                            continue
+                        cells_c.append(item)
+                        texts.append(_cell_value_text(item))
+                    if not cells_c:
+                        continue
+                    # 跳过整行为空的占位行；同时跳过疑似表头行（与识别到的列名高度一致）
+                    joined = ' | '.join(texts)
+                    if not joined.strip(' |'):
+                        continue
+                    norm_texts = [normalize_col(t) for t in texts if t]
+                    if actual_col_names and norm_texts:
+                        hdr_hits = sum(1 for t, c in zip(norm_texts, actual_col_names)
+                                       if normalize_col(c) == t)
+                        if hdr_hits >= min(len(norm_texts), len(actual_col_names)) and hdr_hits >= 2:
+                            continue
+                    parsed.append((joined, [t for t in texts]))
+                if len(parsed) >= max(2, len(expected_data)):
+                    logger.info(f"✅ 策略D (GridPattern): 通过官方行列 API 读取到 {len(parsed)} 行 x 若干列")
+                    grid_cells = parsed
+                    data_rows = [c[1][0] for c in parsed]
+                elif parsed:
+                    logger.warning(f"⚠️ GridPattern 仅读到 {len(parsed)} 行，少于预期，继续尝试其他策略")
         except Exception as e:
-            logger.warning(f"⚠️ 获取行结构异常: {e}")
-            data_rows = []
+            logger.debug(f"GridPattern 读取异常: {e}")
+
+        # --- 策略 E：子树结构找 Row/DataItem 行控件 ---
+        if not grid_cells:
+            try:
+                data_rows = _dedupe_rows(_find_rows_structural())
+            except Exception as e:
+                logger.warning(f"⚠️ 获取行结构异常: {e}")
+                data_rows = []
+
+        # --- 策略 F：仍无行 → 对整个表格区域 OCR，按坐标聚类成行列 ---
+        if not grid_cells and not data_rows:
+            logger.warning('⚠️ UIA 未发现行控件，尝试对表格区域整体 OCR 兜底提取数据')
+            try:
+                grid_cells = self._ocr_extract_table_cells(actual_table, actual_col_names)
+            except Exception as e:
+                logger.warning(f"⚠️ 表格 OCR 兜底异常: {e}")
 
         def _read_cells(row_ctrl):
             """从行控件递归提取单元格；优先读取 ValuePattern，去重并保留 UIA 顺序。"""
@@ -1501,14 +1928,8 @@ class UnifiedDesktopController:
                     if 'Header' in typ or 'Header' in name:
                         continue
                     # 单元格一般是 DataItem；Text/Custom 仅作为 provider 的兜底。
-                    if typ in ('DataItem', 'Text'):
-                        val = name
-                        try:
-                            vp = self._get_value_pattern(child)
-                            if vp:
-                                val = str(vp.Value)
-                        except Exception:
-                            pass
+                    if typ in ('DataItem', 'Text', 'Edit', 'Custom'):
+                        val = _cell_value_text(child)
                         found.append((child, str(val or '')))
                     else:
                         walk(child, depth + 1)
@@ -1526,14 +1947,17 @@ class UnifiedDesktopController:
                 report_details.append(row_report)
                 continue
             
-            current_row_ctrl = data_rows[ui_row_index]
-            
-            # 在当前行中查找单元格
-            # DataGridView 的单元格通常是 DataItem，Name 格式可能是 "Value" 或 "ColumnName Value" 或 "Row X Column Y"
-            # 最可靠的是利用 GridItemPattern 或者按顺序读取
-            
-            # UIA 行可能有嵌套容器，不能只读取直接子项；递归提取真实单元格。
-            cells = _read_cells(current_row_ctrl)
+            # 若 GridPattern/OCR 兜底成功，直接使用其按行列切好的单元格文本
+            if grid_cells:
+                _, row_cellCtrls = grid_cells[ui_row_index]
+                if isinstance(row_cellCtrls, list) and row_cellCtrls and not isinstance(row_cellCtrls[0], str):
+                    cells = [(c, _cell_value_text(c)) for c in row_cellCtrls]
+                else:
+                    cells = [(None, t) for t in row_cellCtrls]
+            else:
+                current_row_ctrl = data_rows[ui_row_index]
+                # UIA 行可能有嵌套容器，不能只读取直接子项；递归提取真实单元格。
+                cells = _read_cells(current_row_ctrl)
             
             # 如果 Cells 数量与 匹配列数量 不一致，可能有问题，但我们按索引对应
             # 注意：cells 的顺序应该与 actual_col_names 的顺序一致
@@ -1555,7 +1979,7 @@ class UnifiedDesktopController:
                 if col_idx < len(cells):
                     cell, actual_val_str = cells[col_idx]
                     cell_found = True
-                else:
+                elif not grid_cells:
                     # 兜底：按列索引在整行后代中寻找 DataItem/Cell 控件；
                     # 不再用列标题匹配单元格名称，因为多数 UIA 单元格名称只返回值。
                     try:
@@ -1572,8 +1996,7 @@ class UnifiedDesktopController:
                         if col_idx < len(candidates):
                             cell = candidates[col_idx]
                             cell_found = True
-                            vp = self._get_value_pattern(cell)
-                            actual_val_str = str(vp.Value) if vp else _ctrl_name(cell)
+                            actual_val_str = _cell_value_text(cell)
                     except Exception as e:
                         logger.debug(f"单元格索引兜底失败: {e}")
 
@@ -1973,6 +2396,37 @@ class UnifiedDesktopController:
         logger.warning(f"⚠️ 日期值 '{value}' 无法解析为 年/月/日")
         return None
 
+    def _read_displayed_date(self, ctrl):
+        """尽力读取日期控件当前显示的日期文本：优先 ValuePattern.Value（部分 .NET
+        DateTimePicker provider 的 Name 为空、值只在 Value 里），退回 Name。
+        返回 (文本或None, 本次读取是否成功)。"""
+        val = None
+        try:
+            vp = self._get_value_pattern(ctrl)
+            if vp is not None and getattr(vp, 'Value', None):
+                val = str(vp.Value)
+        except Exception:
+            pass
+        if val and val.strip():
+            return val, True
+        try:
+            name_val = ctrl.Name
+        except Exception:
+            return val, False
+        if name_val and str(name_val).strip():
+            return str(name_val), True
+        return (val or name_val or ""), True
+
+    def _date_texts_equal(self, a, b):
+        """比较两个日期显示文本是否表示同一天：能解析就按 (年,月,日) 元组比较，
+        避免仅因零填充（2020年5月6日 vs 2020年05月06日）或分隔符不同而误报失败；
+        两边都解析不了时才退回字符串比较。"""
+        pa = self._parse_date_value(a) if a else None
+        pb = self._parse_date_value(b) if b else None
+        if pa and pb:
+            return pa == pb
+        return str(a or '').strip() == str(b or '').strip()
+
     def _set_datetimepicker_value(self, ctrl, value):
         """直接通过 Win32 消息 DTM_SETSYSTEMTIME 给 SysDateTimePick32 控件设值。
 
@@ -1995,6 +2449,7 @@ class UnifiedDesktopController:
         try:
             DTM_FIRST = 0x1000
             DTM_SETSYSTEMTIME = DTM_FIRST + 2
+            DTM_GETSYSTEMTIME = DTM_FIRST + 1
             GDT_VALID = 0
 
             class SYSTEMTIME(ctypes.Structure):
@@ -2008,12 +2463,23 @@ class UnifiedDesktopController:
             st = SYSTEMTIME()
             st.wYear, st.wMonth, st.wDay = year, month, day
             st.wDayOfWeek = st.wHour = st.wMinute = st.wSecond = st.wMilliseconds = 0
-            ok = ctypes.windll.user32.SendMessageW(hwnd, DTM_SETSYSTEMTIME, GDT_VALID, ctypes.byref(st))
-            if ok:
-                logger.info(f"✅ 原生消息设置日期成功: {year}-{month:02d}-{day:02d}")
-                return True
-            logger.warning("⚠️ DTM_SETSYSTEMTIME 返回失败")
-            return False
+            # 【修复】SendMessageW 的返回值是"被发消息控件的返回值"：对 DTM_SETSYSTEMTIME
+            # 而言，成功返回 GDT_VALID(0)、失败才返回非 0。旧实现写的是 `if ok:`，
+            # 恰好把结果判反了——明明设置成功(返回0)却走进"返回失败"分支报失败，
+            # 这就是【日期填充正确、却报失败】的直接原因之一。
+            result = ctypes.windll.user32.SendMessageW(hwnd, DTM_SETSYSTEMTIME, GDT_VALID, ctypes.byref(st))
+            if result != GDT_VALID:
+                logger.warning(f"⚠️ DTM_SETSYSTEMTIME 返回失败(code={result})")
+                return False
+            # 设置成功后再用 DTM_GETSYSTEMTIME 回读校验（同样按 MSDN：成功返回 GDT_VALID）
+            st_read = SYSTEMTIME()
+            got = ctypes.windll.user32.SendMessageW(hwnd, DTM_GETSYSTEMTIME, 0, ctypes.byref(st_read))
+            if got == GDT_VALID and (st_read.wYear, st_read.wMonth, st_read.wDay) != (year, month, day):
+                logger.warning(f"⚠️ 原生消息设置日期后回读不符: "
+                               f"{st_read.wYear}-{st_read.wMonth}-{st_read.wDay} != {year}-{month}-{day}")
+                return False
+            logger.info(f"✅ 原生消息设置日期成功: {year}-{month:02d}-{day:02d}")
+            return True
         except Exception as e:
             logger.warning(f"⚠️ DTM_SETSYSTEMTIME 设置日期异常: {e}")
             return False
@@ -2076,6 +2542,16 @@ class UnifiedDesktopController:
         if not desc:
             desc = f"日期控件录入 = {value}"
         parsed = self._parse_date_value(value)
+
+        # 【修复】先回读控件当前显示值：若已经等于目标日期，直接判成功。
+        # 否则一旦控件本来就显示着正确日期（或上一次运行残留的正确值），
+        # 后面的键盘分段录入可能因焦点/时序问题没生效，回读比对却把"本来正确"
+        # 的显示当成录入结果去校验——但只要中途任何一步 UIA 抖动，就会被误报为失败。
+        before_text, before_read_ok = self._read_displayed_date(ctrl)
+        if parsed and before_read_ok and self._date_texts_equal(before_text, value):
+            logger.info(f"✅ {desc} 控件当前显示已等于目标日期，无需重复录入")
+            return True, before_text
+
         ok_focus, _ = self._retry_uia_call(ctrl.SetFocus, desc=f"{desc} SetFocus")
         if not ok_focus:
             return False, None
@@ -2111,16 +2587,22 @@ class UnifiedDesktopController:
 
         self._retry_uia_call(auto.SendKeys, '{Enter}', desc=f"{desc} 确认Enter")
         time.sleep(0.2)
-        # 回读校验：日期控件的 Name 就是当前显示的日期文本（如 '2026年08月02日'）；
-        # 读取本身也可能撞上偶发 COM 异常——读取失败不代表没写成功，不能当失败处理。
-        ok_read, name_val = self._retry_uia_call(lambda: ctrl.Name, retries=1, delay=0.2, desc=f"{desc} 回读校验")
+        # 回读校验：日期控件显示的日期文本可能在 Name，也可能只在 ValuePattern.Value
+        # （部分 .NET DateTimePicker provider 的 Name 为空串）——旧实现只读 ctrl.Name，
+        # 读到空串后与目标日期比对必然不符，导致【明明填充正确却被误报失败】。
+        # 这里统一走 _read_displayed_date 双通道读取；读取本身也可能撞上偶发 COM 异常，
+        # 读取失败不代表没写成功，不能当失败处理。
+        def _do_read():
+            text, read_ok = self._read_displayed_date(ctrl)
+            if not read_ok:
+                raise RuntimeError("日期控件显示值读取失败(Name与Value均为空引用)")
+            return text
+        ok_read, name_val = self._retry_uia_call(_do_read, retries=1, delay=0.2, desc=f"{desc} 回读校验")
         if ok_read and parsed:
-            y, mo, d = parsed
             name_str = str(name_val or "")
             # 日期控件可能按本地格式显示 2020年5月6日、2020年05月06日或 2020/5/6；
             # 统一解析为年月日比较，避免仅因零填充/分隔符不同误报失败。
-            displayed = self._parse_date_value(name_str)
-            success = displayed == (y, mo, d)
+            success = self._date_texts_equal(name_str, value)
             if not success:
                 logger.warning(f"⚠️ {desc} 键盘录入后回读日期 '{name_str}' 与目标不符")
             return success, name_val
